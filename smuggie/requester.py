@@ -13,40 +13,66 @@ from http.client import parse_headers
 
 import io
 import time
+import collections
 
 
 context.log_level = 'error'
 
+'''
+Parse out headers to OrdereDict({key => val})
+
+XXX: hacky parsing that doesn't conform to RFC, TODO...
+NOTE: DO NOT reuse this code in your projects as this code itself could enable
+  request smuggling attacks!
+'''
+def parse_header(raw_request):
+    headers = raw_request.split('\r\n\r\n', 1)[0].strip().split('\r\n')
+    headers.pop(0) # remove the first line (GET / HTTP/1.1)
+
+    output_dict = collections.OrderedDict()
+
+    for header in headers:
+        key, value = header.strip().split(': ', 1)
+
+        # XXX: find a better case insensitive solution
+        key = key.lower()
+        assert key not in output_dict
+
+        output_dict[key] = values
+
+    return output_dict
+
 
 class Request:
-    def __init__(self, request, host = None, port = None, config = dict()):
-        self.request = self._cleanup(smartbytes(request))
+    def __init__(self, raw_request, host = None, port = None, request_config = dict()):
+        self.raw_request = self._cleanup(smartbytes(raw_request))
 
-        self.headers = {
-            key : val
-            for key, val in
-            parse_headers(BytesIO(bytes(self.request))).items()
-        }
+        self.headers = parse_header(self.raw_request)
 
-        self.host = host or request.headers['Host']
+        self.host = host or self.headers['host']
         self.port = port or (443 if host.startswith('http:') else 80)
-        self.config = config
+
+        assert self.host
+        assert self.port
+
+        self.request_config = {
+            # prioritize Request's config over the RequestWorker's
+            **worker.request_config,
+            **request_config
+        }
 
     def _cleanup(self):
         # cleanup potential CRLF issues
         # XXX: move this to before generating the payloads so that we can use
         #   LF without CR in some potential exploits
-        return self.request.replace('\r', '').replace('\n', '\r\n')
+        return self.raw_request.replace('\r', '').replace('\n', '\r\n')
 
     def _execute(self, worker):
         self.error = False
 
         try:
             time_pre_connect = time.time()
-            self.socket = remote(self.host, self.port, {
-                **worker.config,
-                **self.config
-            })
+            self.socket = remote(self.host, self.port, self.request_config)
             self.time_connect = time.time() - time_pre_connect
 
             self.socket.write(bytes(self.request))
@@ -67,16 +93,14 @@ class Request:
 
 
 class RequestWorker(Thread):
-    def __init__(self, engine, host, port, handlers = list(), config = dict()):
-        self.engine = engine
+    def __init__(self, host, port, request_config = dict()):
         self.host = host.strip()
         self.port = port
-        self._handlers = handlers
-        self.config = {**{
+        self.request_config = {**{
             'tls' : (True if self.port == 443 else False),
             'timeout' : 5,
             'level' : 'error'
-        }, **config}
+        }, **request_config}
 
         # internal
         self._queue = list()
@@ -84,14 +108,10 @@ class RequestWorker(Thread):
     def queue(self, request):
         self._queue.append(request)
 
-    def _handle(self, request):
-        for handler in self._handlers:
-            if handler(request) == False:
-                return False
-
-        return True
-
     def run(self):
+        self.results = list() # keep order
+
+        # loop broken by .pop(0) IndexError
         while True:
             try:
                 request = self._queue.pop(0)
@@ -105,64 +125,5 @@ class RequestWorker(Thread):
                 log.error(f'Skipping request due to host or port mismatch (request {request.host}:{request.port} != worker {self.host}:{self.port})')
                 continue
 
-
-
-            self._handle(request._execute(self))
-
-
-'''
-XXX: deprecated
-'''
-'''
-class RequestEngine:
-    def __init__(self, max_workers = 5, config = dict(), handlers = list()):
-        self.max_workers = max_workers
-        self.config = config
-        self._handlers = [self._handle] + handlers
-
-        # internal
-        self._workers = set()
-        self._workers_cache = list()
-        self._started = False
-
-    def _handle(self, request):
-        assert self._started
-
-        return True
-
-    def _get_worker(self, host, port):
-        assert not self._started
-
-        for worker in self._workers_cache:
-            if host == worker.host and port == worker.port:
-                return worker
-
-        worker = RequestWorker(self, host, port, handlers = self._handlers, config = self.config)
-        self._workers_cache.append(worker)
-        return worker
-
-    def queue(self, request):
-        assert not self._started
-
-        worker = self._get_worker(request.host, request.port)
-        self.workers.add(worker)
-        worker.queue(request)
-
-        return worker
-
-    def start(self, block = True):
-        assert not self._started
-        self._started = True
-
-        for worker in self._workers:
-            worker.start()
-
-        if block:
-            self.join()
-
-    def join(self):
-        assert self._started
-
-        for worker in self._workers:
-            worker.join()
-'''
+            result = request._execute(self)
+            self.results.append(result)
